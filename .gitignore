@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+
+# Local/generated bot data
+html/
+snapshots/
+text/
+reports/
+logs/
+inputs/
+browser_profile/
+teste_saida/
+teste_tmp/
+
+# Local environment
+.env
+.env.*
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
