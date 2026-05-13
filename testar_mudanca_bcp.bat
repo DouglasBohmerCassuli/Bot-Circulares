@@ -36,10 +36,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Write-Host 'HTML original:' $original;" ^
   "Write-Host 'HTML mudado:' $changed;" ^
   "Write-Host 'Base de teste:' $testBase;" ^
-  "& python '.\extrair_html_bcp.py' --source-html $original --base-dir $testBase --no-open --no-pdf;" ^
+  "& python '.\extrair_html_bcp.py' --targets circulares --source-html $original --base-dir $testBase --no-open --no-pdf;" ^
   "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }" ^
   "Start-Sleep -Seconds 1;" ^
-  "& python '.\extrair_html_bcp.py' --source-html $changed --base-dir $testBase --no-pdf;" ^
+  "& python '.\extrair_html_bcp.py' --targets circulares --source-html $changed --base-dir $testBase --no-pdf;" ^
   "exit $LASTEXITCODE"
 
 if errorlevel 1 (

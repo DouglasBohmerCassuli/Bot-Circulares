@@ -19,9 +19,22 @@ from typing import Any
 from urllib.parse import urldefrag, urljoin, urlparse
 
 
-URL = "https://www.bcp.gov.py/web/institucional/circulares"
+CIRCULARES_URL = "https://www.bcp.gov.py/web/institucional/circulares"
+PROYECTOS_NORMATIVOS_URL = "https://www.bcp.gov.py/web/institucional/proyectos-normativos-"
+URL = CIRCULARES_URL
 DEFAULT_KEEP_RUNS = 10
 TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S_%f"
+
+
+@dataclass(frozen=True)
+class MonitorTarget:
+    slug: str
+    label: str
+    url: str
+    item_singular: str
+    item_plural: str
+    keyword: str | None = None
+    selector: str = "div.list__item.search-item"
 
 
 @dataclass
@@ -33,6 +46,9 @@ class Circular:
     month: str
     category: str
     url: str
+    period: str = ""
+    project_url: str = ""
+    comments_url: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -43,6 +59,9 @@ class Circular:
             "month": self.month,
             "category": self.category,
             "url": self.url,
+            "period": self.period,
+            "project_url": self.project_url,
+            "comments_url": self.comments_url,
         }
 
 class CircularListParser(HTMLParser):
@@ -93,6 +112,80 @@ class CircularListParser(HTMLParser):
         text = normalize_spaces(data)
         if text:
             self._current["texts"].append(text)
+
+
+class TableRowParser(HTMLParser):
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.rows: list[dict[str, Any]] = []
+        self._current: dict[str, Any] | None = None
+        self._row_depth = 0
+        self._current_cell: dict[str, Any] | None = None
+        self._current_link: dict[str, Any] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr = {name.lower(): value or "" for name, value in attrs}
+
+        if tag == "tr" and self._current is None:
+            self._current = {"texts": [], "links": [], "cells": []}
+            self._row_depth = 1
+            return
+
+        if self._current is None:
+            return
+
+        if tag == "tr":
+            self._row_depth += 1
+        elif tag in {"td", "th"} and self._current_cell is None:
+            self._current_cell = {"texts": [], "links": []}
+        elif tag == "a" and attr.get("href"):
+            attr["href"] = urljoin(self.base_url, attr["href"])
+            attr["text_parts"] = []
+            self._current_link = attr
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._current is None:
+            return
+
+        tag = tag.lower()
+        if tag == "a" and self._current_link is not None:
+            self._current_link["text"] = normalize_spaces(" ".join(self._current_link.pop("text_parts", [])))
+            self._current["links"].append(self._current_link)
+            if self._current_cell is not None:
+                self._current_cell["links"].append(self._current_link)
+            self._current_link = None
+            return
+
+        if tag in {"td", "th"} and self._current_cell is not None:
+            self._current["cells"].append(self._current_cell)
+            self._current_cell = None
+            return
+
+        if tag != "tr":
+            return
+
+        self._row_depth -= 1
+        if self._row_depth <= 0:
+            if self._current["texts"] or self._current["links"]:
+                self.rows.append(self._current)
+            self._current = None
+            self._row_depth = 0
+
+    def handle_data(self, data: str) -> None:
+        if self._current is None:
+            return
+
+        text = normalize_spaces(data)
+        if not text:
+            return
+
+        self._current["texts"].append(text)
+        if self._current_cell is not None:
+            self._current_cell["texts"].append(text)
+        if self._current_link is not None:
+            self._current_link["text_parts"].append(text)
 
 
 class VisibleTextParser(HTMLParser):
@@ -183,16 +276,59 @@ def choose_document_url(links: list[dict[str, str]]) -> str:
     return links[0].get("href", "")
 
 
-def extract_circulars(page_html: str, base_url: str) -> list[Circular]:
+def choose_project_url(links: list[dict[str, str]]) -> str:
+    for link in links:
+        if normalize_key(link.get("text", "")) in {"descargar", "download"}:
+            return link.get("href", "")
+    return links[0].get("href", "") if links else ""
+
+
+def first_link_url(cell: dict[str, Any] | None) -> str:
+    if not cell:
+        return ""
+
+    links = cell.get("links", [])
+    return links[0].get("href", "") if links else ""
+
+
+def first_link_text(cell: dict[str, Any] | None) -> str:
+    if not cell:
+        return ""
+
+    for link in cell.get("links", []):
+        text = normalize_spaces(link.get("text", ""))
+        if text:
+            return text
+    return ""
+
+
+def cell_text(cell: dict[str, Any] | None) -> str:
+    if not cell:
+        return ""
+    return clean_item_title(cell.get("texts", []))
+
+
+def extract_period(texts: list[str]) -> str:
+    for text in texts:
+        normalized = normalize_key(text)
+        if "hasta" in normalized or "periodo" in normalized or re.search(r"\d{1,2}/\d{1,2}/\d{4}", text):
+            return text
+    return ""
+
+
+def extract_items(page_html: str, base_url: str, keyword: str | None = None) -> list[Circular]:
     parser = CircularListParser(base_url)
     parser.feed(page_html)
 
-    circulars: list[Circular] = []
+    items: list[Circular] = []
     seen: set[str] = set()
 
     for item in parser.items:
         title = clean_item_title(item["texts"])
-        if not title or "circular" not in normalize_key(title):
+        if not title:
+            continue
+
+        if keyword and keyword not in normalize_key(title):
             continue
 
         url = choose_document_url(item["links"])
@@ -204,7 +340,7 @@ def extract_circulars(page_html: str, base_url: str) -> list[Circular]:
             continue
 
         seen.add(circular_id)
-        circulars.append(
+        items.append(
             Circular(
                 id=circular_id,
                 title=title,
@@ -216,7 +352,56 @@ def extract_circulars(page_html: str, base_url: str) -> list[Circular]:
             )
         )
 
-    return circulars
+    return items
+
+
+def extract_circulars(page_html: str, base_url: str) -> list[Circular]:
+    return extract_items(page_html, base_url, keyword="circular")
+
+
+def extract_project_items(page_html: str, base_url: str) -> list[Circular]:
+    parser = TableRowParser(base_url)
+    parser.feed(page_html)
+
+    projects: list[Circular] = []
+    seen: set[str] = set()
+
+    for row in parser.rows:
+        cells = row.get("cells", [])
+        title_cell = cells[0] if len(cells) >= 1 else None
+        comments_cell = cells[1] if len(cells) >= 2 else None
+        period_cell = cells[2] if len(cells) >= 3 else None
+
+        title = first_link_text(title_cell) or cell_text(title_cell)
+
+        if not title or "proyecto" not in normalize_key(title):
+            continue
+
+        period = cell_text(period_cell) or extract_period(row["texts"])
+        project_url = first_link_url(title_cell)
+        comments_url = first_link_url(comments_cell)
+        item_id = sha256_text(normalize_key(title))[:16]
+
+        if item_id in seen:
+            continue
+
+        seen.add(item_id)
+        projects.append(
+            Circular(
+                id=item_id,
+                title=title,
+                number="",
+                year="",
+                month="",
+                category="Proyectos Normativos",
+                url=project_url or comments_url,
+                period=period,
+                project_url=project_url,
+                comments_url=comments_url,
+            )
+        )
+
+    return projects
 
 
 def extract_visible_lines(page_html: str) -> list[str]:
@@ -251,6 +436,12 @@ def ensure_directories(base_dir: Path) -> dict[str, Path]:
         folder.mkdir(parents=True, exist_ok=True)
 
     return dirs
+
+
+def target_base_dir(base_dir: Path, target: MonitorTarget) -> Path:
+    if target.slug == "circulares":
+        return base_dir
+    return base_dir / target.slug
 
 
 def configure_logging(log_dir: Path) -> None:
@@ -297,13 +488,16 @@ def minimize_browser_window(page: Any) -> None:
         logging.warning("Nao consegui minimizar a janela do navegador: %s", exc)
 
 
-def fetch_live_html(
-    url: str,
+def fetch_live_htmls(
+    targets: list[MonitorTarget],
     timeout_ms: int,
     headless: bool,
     minimized: bool,
     user_data_dir: Path,
-) -> str:
+) -> dict[str, str]:
+    if not targets:
+        return {}
+
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
@@ -314,7 +508,7 @@ def fetch_live_html(
             "e depois python -m playwright install chromium"
         ) from exc
 
-    logging.info("Acessando %s", url)
+    logging.info("Acessando %s", ", ".join(target.url for target in targets))
     launch_args = []
     if minimized and not headless:
         launch_args = [
@@ -331,27 +525,68 @@ def fetch_live_html(
             args=launch_args,
         )
         try:
-            page = context.pages[0] if context.pages else context.new_page()
+            first_page = context.pages[0] if context.pages else context.new_page()
+            for extra_page in context.pages[1:]:
+                try:
+                    extra_page.close()
+                except Exception as exc:
+                    logging.warning("Nao consegui fechar uma aba antiga: %s", exc)
+
+            pages: list[tuple[MonitorTarget, Any]] = []
+            for index, target in enumerate(targets):
+                page = first_page if index == 0 else context.new_page()
+                pages.append((target, page))
+
             if minimized and not headless:
-                minimize_browser_window(page)
+                minimize_browser_window(first_page)
 
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            for target, page in pages:
+                logging.info("Abrindo aba %s: %s", target.label, target.url)
+                page.goto(target.url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except PlaywrightTimeoutError:
-                logging.warning("networkidle nao ocorreu; seguindo com o HTML carregado.")
+            html_by_target: dict[str, str] = {}
+            for target, page in pages:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except PlaywrightTimeoutError:
+                    logging.warning(
+                        "networkidle nao ocorreu em %s; seguindo com o HTML carregado.",
+                        target.label,
+                    )
 
-            try:
-                selector_timeout = 180000 if not headless else 20000
-                page.wait_for_selector("div.list__item.search-item", timeout=selector_timeout)
-            except PlaywrightTimeoutError:
-                logging.warning("Nao encontrei div.list__item.search-item dentro do tempo limite.")
+                try:
+                    selector_timeout = 180000 if not headless else 20000
+                    page.wait_for_selector(target.selector, timeout=selector_timeout)
+                except PlaywrightTimeoutError:
+                    logging.warning(
+                        "Nao encontrei %s em %s dentro do tempo limite.",
+                        target.selector,
+                        target.label,
+                    )
 
-            logging.info("HTML da pagina de circulares capturado.")
-            return page.content()
+                html_by_target[target.slug] = page.content()
+                logging.info("HTML capturado: %s.", target.label)
+
+            return html_by_target
         finally:
             context.close()
+
+
+def fetch_live_html(
+    url: str,
+    timeout_ms: int,
+    headless: bool,
+    minimized: bool,
+    user_data_dir: Path,
+) -> str:
+    target = MonitorTarget(
+        slug="pagina",
+        label="Pagina",
+        url=url,
+        item_singular="item",
+        item_plural="itens",
+    )
+    return fetch_live_htmls([target], timeout_ms, headless, minimized, user_data_dir)[target.slug]
 
 
 def read_html_source(
@@ -403,6 +638,21 @@ def load_snapshot_text(snapshot: dict[str, Any]) -> list[str]:
     return path.read_text(encoding="utf-8", errors="ignore").splitlines()
 
 
+def build_project_table_lines(items: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for index, item in enumerate(items, start=1):
+        lines.extend(
+            [
+                f"Projeto normativo {index}",
+                f"Titulo: {item.get('title', '')}",
+                f"Arquivo do projeto: {item.get('project_url') or item.get('url', '')}",
+                f"Tabela para comentarios: {item.get('comments_url', '')}",
+                f"Periodo de consulta: {item.get('period', '')}",
+            ]
+        )
+    return lines
+
+
 def compare_snapshots(
     previous: dict[str, Any] | None,
     current: dict[str, Any],
@@ -419,14 +669,14 @@ def compare_snapshots(
             "diff_lines": [],
         }
 
-    previous_circulars = previous.get("circulars", []) if previous else []
-    current_circulars = current.get("circulars", [])
+    previous_items = previous.get("items", previous.get("circulars", [])) if previous else []
+    current_items = current.get("items", current.get("circulars", []))
 
-    previous_by_id = {item["id"]: item for item in previous_circulars}
-    current_by_id = {item["id"]: item for item in current_circulars}
+    previous_by_id = {item["id"]: item for item in previous_items}
+    current_by_id = {item["id"]: item for item in current_items}
 
-    new_items = [item for item in current_circulars if item["id"] not in previous_by_id]
-    removed_items = [item for item in previous_circulars if item["id"] not in current_by_id]
+    new_items = [item for item in current_items if item["id"] not in previous_by_id]
+    removed_items = [item for item in previous_items if item["id"] not in current_by_id]
     changed_items = [
         {
             "before": previous_by_id[item_id],
@@ -451,9 +701,9 @@ def compare_snapshots(
         )
 
     if new_items:
-        status = "nova_circular"
+        status = "novo_item"
     elif removed_items or changed_items:
-        status = "circulares_alteradas"
+        status = "itens_alterados"
     elif page_changed:
         status = "pagina_alterada"
     else:
@@ -469,16 +719,29 @@ def compare_snapshots(
     }
 
 
-def status_label(status: str) -> str:
-    labels = {
-        "primeira_execucao": "Primeira execucao",
-        "nova_circular": "Nova circular encontrada",
-        "circulares_alteradas": "Circulares alteradas",
-        "pagina_alterada": "Pagina alterada sem nova circular",
-        "sem_mudanca": "Sem mudanca",
-        "erro": "Erro na execucao",
-    }
-    return labels.get(status, status)
+def status_label(status: str, item_singular: str = "item", item_plural: str = "itens") -> str:
+    singular_key = normalize_key(item_singular)
+    plural_title = item_plural[:1].upper() + item_plural[1:]
+
+    if status == "primeira_execucao":
+        return "Primeira execucao"
+    if status in {"novo_item", "nova_circular"}:
+        if singular_key == "circular":
+            return "Nova circular encontrada"
+        return f"Novo {item_singular} encontrado"
+    if status in {"itens_alterados", "circulares_alteradas"}:
+        if singular_key == "circular":
+            return "Circulares alteradas"
+        return f"{plural_title} alterados"
+    if status == "pagina_alterada":
+        if singular_key == "circular":
+            return "Pagina alterada sem nova circular"
+        return f"Pagina alterada sem novo {item_singular}"
+    if status == "sem_mudanca":
+        return "Sem mudanca"
+    if status == "erro":
+        return "Erro na execucao"
+    return status
 
 
 def escape(value: Any) -> str:
@@ -498,12 +761,46 @@ def external_link(url: str, label: str | None = None) -> str:
     return f'<a href="{escape(url)}" target="_blank" rel="noopener">{escape(text)}</a>'
 
 
+def has_project_fields(items: list[dict[str, Any]]) -> bool:
+    return any(item.get("period") or item.get("project_url") or item.get("comments_url") for item in items)
+
+
+def render_project_details(item: dict[str, Any]) -> str:
+    details = [
+        f"<strong>Titulo:</strong> {escape(item.get('title', ''))}",
+        f"<strong>Arquivo:</strong> {external_link(item.get('project_url') or item.get('url', ''), 'Abrir') or '-'}",
+        f"<strong>Tabela:</strong> {external_link(item.get('comments_url', ''), 'Abrir') or '-'}",
+        f"<strong>Periodo:</strong> {escape(item.get('period', '') or '-')}",
+    ]
+    return "<br>".join(details)
+
+
 def render_circular_table(title: str, items: list[dict[str, Any]], highlight: bool = False) -> str:
     if not items:
         return f"<section><h2>{escape(title)}</h2><p>Nenhum item.</p></section>"
 
     rows = []
     row_class = ' class="changed-row"' if highlight else ""
+    if has_project_fields(items):
+        for item in items:
+            rows.append(
+                f"<tr{row_class}>"
+                f"<td>{escape(item.get('title', ''))}</td>"
+                f"<td>{external_link(item.get('project_url') or item.get('url', ''), 'Abrir')}</td>"
+                f"<td>{external_link(item.get('comments_url', ''), 'Abrir')}</td>"
+                f"<td>{escape(item.get('period', ''))}</td>"
+                "</tr>"
+            )
+
+        return (
+            f"<section><h2>{escape(title)}</h2>"
+            "<table><thead><tr>"
+            "<th>Titulo</th><th>Arquivo do projeto</th><th>Tabela para comentarios</th><th>Periodo de consulta</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></section>"
+        )
+
     for item in items:
         rows.append(
             f"<tr{row_class}>"
@@ -525,11 +822,39 @@ def render_circular_table(title: str, items: list[dict[str, Any]], highlight: bo
     )
 
 
-def render_changed_table(changed_items: list[dict[str, dict[str, Any]]]) -> str:
+def render_changed_table(
+    changed_items: list[dict[str, dict[str, Any]]],
+    title: str = "Itens com dados alterados",
+) -> str:
     if not changed_items:
-        return "<section><h2>Circulares com dados alterados</h2><p>Nenhum item.</p></section>"
+        return f"<section><h2>{escape(title)}</h2><p>Nenhum item.</p></section>"
 
     rows = []
+    project_style = any(
+        has_project_fields([item["before"], item["after"]])
+        for item in changed_items
+    )
+    if project_style:
+        for item in changed_items:
+            before = item["before"]
+            after = item["after"]
+            rows.append(
+                '<tr class="changed-row">'
+                f"<td>{escape(after.get('title', before.get('title', '')))}</td>"
+                f"<td>{render_project_details(before)}</td>"
+                f"<td>{render_project_details(after)}</td>"
+                "</tr>"
+            )
+
+        return (
+            f"<section><h2>{escape(title)}</h2>"
+            "<table><thead><tr>"
+            "<th>Titulo</th><th>Antes</th><th>Depois</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></section>"
+        )
+
     for item in changed_items:
         before = item["before"]
         after = item["after"]
@@ -543,7 +868,7 @@ def render_changed_table(changed_items: list[dict[str, dict[str, Any]]]) -> str:
         )
 
     return (
-        "<section><h2>Circulares com dados alterados</h2>"
+        f"<section><h2>{escape(title)}</h2>"
         "<table><thead><tr>"
         "<th>Numero</th><th>Antes</th><th>Depois</th><th>Links</th>"
         "</tr></thead><tbody>"
@@ -579,6 +904,23 @@ def write_report(
 ) -> None:
     status = comparison["status"]
     generated_at = current["timestamp"]
+    target_label = current.get("target_label", "Circulares")
+    item_singular = current.get("item_singular", "circular")
+    item_plural = current.get("item_plural", "circulares")
+    current_items = current.get("items", current.get("circulars", []))
+    status_text = status_label(status, item_singular, item_plural)
+
+    if normalize_key(item_singular) == "circular":
+        new_heading = "Novas circulares"
+        removed_heading = "Circulares removidas"
+        changed_heading = "Circulares alteradas"
+        all_heading = "Todas as circulares detectadas agora"
+    else:
+        new_heading = f"Novos {item_plural}"
+        removed_heading = f"{item_plural[:1].upper() + item_plural[1:]} removidos"
+        changed_heading = f"{item_plural[:1].upper() + item_plural[1:]} alterados"
+        all_heading = f"Todos os {item_plural} detectados agora"
+
     has_changes = bool(
         comparison["new_items"]
         or comparison["removed_items"]
@@ -601,7 +943,7 @@ def write_report(
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Bot BCP - {escape(status_label(status))}</title>
+  <title>Bot BCP - {escape(target_label)} - {escape(status_text)}</title>
   <style>
     :root {{
       color-scheme: light;
@@ -732,24 +1074,24 @@ def write_report(
 </head>
 <body>
 <main>
-  <h1>Bot BCP - Monitor de Circulares</h1>
-  <div class="{status_class}">{escape(status_label(status))}</div>
+  <h1>Bot BCP - Monitor de {escape(target_label)}</h1>
+  <div class="{status_class}">{escape(status_text)}</div>
   <p>Execucao: {escape(generated_at)}</p>
   <p>{previous_info}</p>
   <p>Fonte: {escape(current.get('source', ''))}</p>
   <p>Arquivos: {file_link(current['html_file'], 'HTML bruto')} | {file_link(current['text_file'], 'texto limpo')} | {file_link(current['snapshot_file'], 'snapshot JSON')}</p>
 
   <section class="summary">
-    <div class="{new_summary_class}"><strong>{len(comparison['new_items'])}</strong>Novas circulares</div>
-    <div class="{removed_summary_class}"><strong>{len(comparison['removed_items'])}</strong>Circulares removidas</div>
-    <div class="{changed_summary_class}"><strong>{len(comparison['changed_items'])}</strong>Circulares alteradas</div>
-    <div class="summary-item"><strong>{len(current['circulars'])}</strong>Total atual</div>
+    <div class="{new_summary_class}"><strong>{len(comparison['new_items'])}</strong>{escape(new_heading)}</div>
+    <div class="{removed_summary_class}"><strong>{len(comparison['removed_items'])}</strong>{escape(removed_heading)}</div>
+    <div class="{changed_summary_class}"><strong>{len(comparison['changed_items'])}</strong>{escape(changed_heading)}</div>
+    <div class="summary-item"><strong>{len(current_items)}</strong>Total atual</div>
   </section>
 
-  {render_circular_table('Novas circulares', comparison['new_items'], highlight=True)}
-  {render_circular_table('Circulares removidas', comparison['removed_items'], highlight=True)}
-  {render_changed_table(comparison['changed_items'])}
-  {render_circular_table('Todas as circulares detectadas agora', current['circulars'])}
+  {render_circular_table(new_heading, comparison['new_items'], highlight=True)}
+  {render_circular_table(removed_heading, comparison['removed_items'], highlight=True)}
+  {render_changed_table(comparison['changed_items'], changed_heading)}
+  {render_circular_table(all_heading, current_items)}
   {render_diff(comparison['diff_lines'])}
 </main>
 </body>
@@ -758,12 +1100,18 @@ def write_report(
     save_text(report_path, html_content)
 
 
-def write_error_report(report_path: Path, error: Exception, timestamp: str, source: str) -> None:
+def write_error_report(
+    report_path: Path,
+    error: Exception,
+    timestamp: str,
+    source: str,
+    target_label: str = "Monitor",
+) -> None:
     html_content = f"""<!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Bot BCP - Erro</title>
+  <title>Bot BCP - Erro - {escape(target_label)}</title>
   <style>
     body {{ font-family: Arial, Helvetica, sans-serif; margin: 32px; color: #1f2933; }}
     main {{ max-width: 900px; margin: 0 auto; border: 1px solid #d8dee6; border-radius: 8px; padding: 24px; }}
@@ -772,7 +1120,7 @@ def write_error_report(report_path: Path, error: Exception, timestamp: str, sour
 </head>
 <body>
 <main>
-  <h1>Bot BCP - Erro na execucao</h1>
+  <h1>Bot BCP - Erro na execucao - {escape(target_label)}</h1>
   <p>Execucao: {escape(timestamp)}</p>
   <p>Fonte: {escape(source)}</p>
   <pre>{escape(repr(error))}</pre>
@@ -843,10 +1191,169 @@ def cleanup_old_runs(base_dir: Path, keep_runs: int) -> None:
             path.unlink()
 
 
-def run_monitor(args: argparse.Namespace) -> Path:
+def build_targets(args: argparse.Namespace) -> list[MonitorTarget]:
+    targets = [
+        MonitorTarget(
+            slug="circulares",
+            label="Circulares",
+            url=args.url,
+            item_singular="circular",
+            item_plural="circulares",
+            keyword="circular",
+        ),
+        MonitorTarget(
+            slug="proyectos_normativos",
+            label="Projetos Normativos",
+            url=args.url_proyectos,
+            item_singular="projeto normativo",
+            item_plural="projetos normativos",
+            selector="table, a[href]",
+        ),
+    ]
+
+    if args.targets == "all":
+        return targets
+
+    return [target for target in targets if target.slug == args.targets]
+
+
+def source_html_for_target(args: argparse.Namespace, target: MonitorTarget) -> str | None:
+    if target.slug == "circulares":
+        return args.source_html_circulares or args.source_html
+    if target.slug == "proyectos_normativos":
+        return args.source_html_proyectos
+    return None
+
+
+def read_html_sources(
+    args: argparse.Namespace,
+    targets: list[MonitorTarget],
+    user_data_dir: Path,
+) -> dict[str, tuple[str, str]]:
+    html_sources: dict[str, tuple[str, str]] = {}
+    live_targets: list[MonitorTarget] = []
+
+    for target in targets:
+        source_html = source_html_for_target(args, target)
+        if source_html:
+            path = Path(source_html).expanduser().resolve()
+            logging.info("Lendo HTML local de %s: %s", target.label, path)
+            html_sources[target.slug] = (
+                path.read_text(encoding="utf-8", errors="ignore"),
+                str(path),
+            )
+        else:
+            live_targets.append(target)
+
+    if live_targets:
+        live_htmls = fetch_live_htmls(
+            live_targets,
+            args.timeout_ms,
+            headless=args.headless,
+            minimized=args.minimized,
+            user_data_dir=user_data_dir,
+        )
+        for target in live_targets:
+            html_sources[target.slug] = (live_htmls[target.slug], target.url)
+
+    return html_sources
+
+
+def process_target_html(
+    target: MonitorTarget,
+    page_html: str,
+    source: str,
+    base_dir: Path,
+    timestamp_dt: datetime,
+    args: argparse.Namespace,
+    browser_profile_dir: Path,
+) -> Path:
+    target_dir = target_base_dir(base_dir, target)
+    dirs = ensure_directories(target_dir)
+    timestamp = timestamp_dt.strftime(TIMESTAMP_FORMAT)
+
+    html_path = dirs["html"] / f"{timestamp}.html"
+    text_path = dirs["text"] / f"{timestamp}.txt"
+    snapshot_path = dirs["snapshots"] / f"{timestamp}.json"
+    report_path = dirs["reports"] / f"{timestamp}.html"
+    pdf_path = dirs["reports"] / f"{timestamp}.pdf"
+
+    save_text(html_path, page_html)
+
+    if is_cloudflare_challenge(page_html):
+        raise RuntimeError(
+            f"O site do BCP entregou uma verificacao do Cloudflare em vez da lista de {target.label}. "
+            "Rode no modo padrao com navegador visivel para resolver a verificacao; "
+            f"o perfil sera reaproveitado em {browser_profile_dir}."
+        )
+
+    if target.slug == "proyectos_normativos":
+        items = extract_project_items(page_html, target.url)
+        if not items:
+            items = extract_items(page_html, target.url, keyword=target.keyword)
+    else:
+        items = extract_items(page_html, target.url, keyword=target.keyword)
+    logging.info("Itens detectados em %s: %s", target.label, len(items))
+
+    if not items:
+        raise RuntimeError(
+            f"Nenhum item foi detectado em {target.label}. "
+            "O HTML foi salvo para analise, mas o snapshot nao foi atualizado."
+        )
+
+    current_items = [item.as_dict() for item in items]
+    if target.slug == "proyectos_normativos":
+        visible_lines = build_project_table_lines(current_items)
+    else:
+        visible_lines = extract_visible_lines(page_html)
+
+    clean_text = "\n".join(visible_lines)
+    save_text(text_path, clean_text)
+
+    current_snapshot = {
+        "timestamp": timestamp_dt.isoformat(timespec="seconds"),
+        "target_slug": target.slug,
+        "target_label": target.label,
+        "item_singular": target.item_singular,
+        "item_plural": target.item_plural,
+        "url": target.url,
+        "source": source,
+        "html_file": str(html_path),
+        "text_file": str(text_path),
+        "snapshot_file": str(snapshot_path),
+        "html_hash": sha256_text(page_html),
+        "text_hash": sha256_text(clean_text),
+        "item_count": len(current_items),
+        "items": current_items,
+    }
+
+    if target.slug == "circulares":
+        current_snapshot["circular_count"] = len(current_items)
+        current_snapshot["circulars"] = current_items
+
+    save_json(snapshot_path, current_snapshot)
+
+    previous_snapshot_path = latest_previous_snapshot(dirs["snapshots"], snapshot_path)
+    previous_snapshot = load_json(previous_snapshot_path) if previous_snapshot_path else None
+    previous_lines = load_snapshot_text(previous_snapshot) if previous_snapshot else []
+
+    comparison = compare_snapshots(previous_snapshot, current_snapshot, previous_lines, visible_lines)
+    logging.info("Status %s: %s", target.label, comparison["status"])
+
+    write_report(report_path, current_snapshot, previous_snapshot, comparison)
+
+    if not args.no_pdf:
+        if generate_pdf(report_path, pdf_path):
+            logging.info("PDF gerado: %s", pdf_path)
+
+    cleanup_old_runs(target_dir, args.keep_runs)
+    return report_path
+
+
+def run_monitor(args: argparse.Namespace) -> tuple[list[Path], bool]:
     base_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else get_user_base_dir()
-    dirs = ensure_directories(base_dir)
-    configure_logging(dirs["logs"])
+    root_dirs = ensure_directories(base_dir)
+    configure_logging(root_dirs["logs"])
     browser_profile_dir = (
         Path(args.user_data_dir).expanduser().resolve()
         if args.user_data_dir
@@ -857,83 +1364,64 @@ def run_monitor(args: argparse.Namespace) -> Path:
     timestamp_dt = datetime.now()
     timestamp = timestamp_dt.strftime(TIMESTAMP_FORMAT)
 
-    html_path = dirs["html"] / f"{timestamp}.html"
-    text_path = dirs["text"] / f"{timestamp}.txt"
-    snapshot_path = dirs["snapshots"] / f"{timestamp}.json"
-    report_path = dirs["reports"] / f"{timestamp}.html"
-    pdf_path = dirs["reports"] / f"{timestamp}.pdf"
-
     logging.info("Base de dados: %s", base_dir)
-    page_html, source = read_html_source(
-        args.source_html,
-        args.url,
-        args.timeout_ms,
-        headless=args.headless,
-        minimized=args.minimized,
-        user_data_dir=browser_profile_dir,
-    )
-    save_text(html_path, page_html)
+    targets = build_targets(args)
+    logging.info("Alvos: %s", ", ".join(target.label for target in targets))
+    html_sources = read_html_sources(args, targets, browser_profile_dir)
 
-    visible_lines = extract_visible_lines(page_html)
-    clean_text = "\n".join(visible_lines)
-    save_text(text_path, clean_text)
+    report_paths: list[Path] = []
+    has_error = False
 
-    if is_cloudflare_challenge(page_html):
-        raise RuntimeError(
-            "O site do BCP entregou uma verificacao do Cloudflare em vez da lista de circulares. "
-            "Rode no modo padrao com navegador visivel para resolver a verificacao; "
-            f"o perfil sera reaproveitado em {browser_profile_dir}."
-        )
+    for target in targets:
+        target_dir = target_base_dir(base_dir, target)
+        dirs = ensure_directories(target_dir)
+        page_html, source = html_sources[target.slug]
 
-    circulars = extract_circulars(page_html, args.url)
-    logging.info("Circulares detectadas: %s", len(circulars))
-
-    if not circulars:
-        raise RuntimeError(
-            "Nenhuma circular foi detectada na pagina. "
-            "O HTML foi salvo para analise, mas o snapshot nao foi atualizado."
-        )
-
-    current_snapshot = {
-        "timestamp": timestamp_dt.isoformat(timespec="seconds"),
-        "url": args.url,
-        "source": source,
-        "html_file": str(html_path),
-        "text_file": str(text_path),
-        "snapshot_file": str(snapshot_path),
-        "html_hash": sha256_text(page_html),
-        "text_hash": sha256_text(clean_text),
-        "circular_count": len(circulars),
-        "circulars": [item.as_dict() for item in circulars],
-    }
-    save_json(snapshot_path, current_snapshot)
-
-    previous_snapshot_path = latest_previous_snapshot(dirs["snapshots"], snapshot_path)
-    previous_snapshot = load_json(previous_snapshot_path) if previous_snapshot_path else None
-    previous_lines = load_snapshot_text(previous_snapshot) if previous_snapshot else []
-
-    comparison = compare_snapshots(previous_snapshot, current_snapshot, previous_lines, visible_lines)
-    logging.info("Status: %s", comparison["status"])
-
-    write_report(report_path, current_snapshot, previous_snapshot, comparison)
-
-    if not args.no_pdf:
-        if generate_pdf(report_path, pdf_path):
-            logging.info("PDF gerado: %s", pdf_path)
-
-    cleanup_old_runs(base_dir, args.keep_runs)
+        try:
+            report_paths.append(
+                process_target_html(
+                    target,
+                    page_html,
+                    source,
+                    base_dir,
+                    timestamp_dt,
+                    args,
+                    browser_profile_dir,
+                )
+            )
+        except Exception as exc:
+            has_error = True
+            logging.exception("Falha na execucao de %s", target.label)
+            report_path = dirs["reports"] / f"{timestamp}_erro.html"
+            write_error_report(report_path, exc, timestamp, source, target.label)
+            cleanup_old_runs(target_dir, args.keep_runs)
+            report_paths.append(report_path)
 
     if not args.no_open:
-        webbrowser.open(report_path.resolve().as_uri())
+        for report_path in report_paths:
+            webbrowser.open(report_path.resolve().as_uri())
 
-    return report_path
+    return report_paths, has_error
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Monitora novas circulares no site do BCP.")
+    parser = argparse.ArgumentParser(description="Monitora paginas institucionais do BCP.")
     parser.add_argument("--url", default=URL, help="URL da pagina de circulares.")
+    parser.add_argument(
+        "--url-proyectos",
+        default=PROYECTOS_NORMATIVOS_URL,
+        help="URL da pagina de projetos normativos.",
+    )
+    parser.add_argument(
+        "--targets",
+        choices=["all", "circulares", "proyectos_normativos"],
+        default="all",
+        help="Quais paginas monitorar. Padrao: all.",
+    )
     parser.add_argument("--base-dir", help="Pasta onde o historico sera salvo. Padrao: %%USERPROFILE%%\\Bot BCP.")
-    parser.add_argument("--source-html", help="HTML local para teste, sem acessar a internet.")
+    parser.add_argument("--source-html", help="HTML local de circulares para teste, sem acessar a internet.")
+    parser.add_argument("--source-html-circulares", help="HTML local de circulares para teste.")
+    parser.add_argument("--source-html-proyectos", help="HTML local de projetos normativos para teste.")
     parser.add_argument("--keep-runs", type=int, default=DEFAULT_KEEP_RUNS, help="Quantidade de execucoes a manter.")
     parser.add_argument("--timeout-ms", type=int, default=60000, help="Timeout do Playwright em milissegundos.")
     browser_mode = parser.add_mutually_exclusive_group()
@@ -965,9 +1453,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
 
     try:
-        report_path = run_monitor(args)
-        console_print(f"Relatorio gerado: {report_path}")
-        return 0
+        report_paths, has_error = run_monitor(args)
+        console_print("Relatorios gerados:")
+        for report_path in report_paths:
+            console_print(f"- {report_path}")
+        return 1 if has_error else 0
     except Exception as exc:
         base_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else get_user_base_dir()
         dirs = ensure_directories(base_dir)
@@ -976,7 +1466,13 @@ def main(argv: list[str] | None = None) -> int:
         timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
         report_path = dirs["reports"] / f"{timestamp}_erro.html"
         logging.exception("Falha na execucao")
-        write_error_report(report_path, exc, timestamp, args.source_html or args.url)
+        source = (
+            args.source_html
+            or args.source_html_circulares
+            or args.source_html_proyectos
+            or "execucao completa"
+        )
+        write_error_report(report_path, exc, timestamp, source)
         cleanup_old_runs(base_dir, args.keep_runs)
 
         if not args.no_open:

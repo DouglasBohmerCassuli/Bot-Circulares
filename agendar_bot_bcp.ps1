@@ -39,7 +39,7 @@ Register-ScheduledTask `
     -Trigger $Trigger `
     -Settings $Settings `
     -Principal $Principal `
-    -Description "Monitora novas circulares no site do Banco Central del Paraguay." `
+    -Description "Monitora circulares e projetos normativos no site do Banco Central del Paraguay." `
     -Force
 
 Write-Host "Tarefa agendada: $TaskName"

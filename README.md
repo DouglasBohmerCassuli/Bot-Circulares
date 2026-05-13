@@ -1,8 +1,9 @@
-# Bot BCP - Circulares
+# Bot BCP
 
-Monitora diariamente a pagina de circulares do Banco Central del Paraguay:
+Monitora diariamente duas paginas do Banco Central del Paraguay:
 
-https://www.bcp.gov.py/web/institucional/circulares
+- Circulares: https://www.bcp.gov.py/web/institucional/circulares
+- Projetos normativos: https://www.bcp.gov.py/web/institucional/proyectos-normativos-
 
 O bot salva HTML bruto, texto limpo, snapshot JSON, relatorio HTML e PDF em:
 
@@ -10,7 +11,8 @@ O bot salva HTML bruto, texto limpo, snapshot JSON, relatorio HTML e PDF em:
 %USERPROFILE%\Bot BCP
 ```
 
-O snapshot captura todos os itens de circular presentes no HTML carregado pelo site.
+O snapshot captura todos os itens detectados no HTML carregado pelo site.
+Para projetos normativos, o bot compara somente a tabela da pagina: titulo, arquivo do projeto, tabela para comentarios e periodo de consulta. Esse historico fica em `%USERPROFILE%\Bot BCP\proyectos_normativos`.
 O historico mantem somente as 10 execucoes mais recentes, apagando automaticamente as mais antigas.
 
 ## Instalar
@@ -35,6 +37,7 @@ Esse instalador confere o Python, instala as dependencias, baixa o Chromium do P
 python .\extrair_html_bcp.py
 ```
 
+Por padrao, ele abre duas abas no mesmo navegador: uma para circulares e outra para projetos normativos.
 O navegador visivel e o padrao, porque o site pode pedir verificacao do Cloudflare. Se quiser forcar explicitamente:
 
 ```powershell
@@ -50,6 +53,13 @@ Para iniciar o navegador visivel, mas minimizado:
 python .\extrair_html_bcp.py --minimized
 ```
 
+Para rodar apenas uma pagina:
+
+```powershell
+python .\extrair_html_bcp.py --targets circulares
+python .\extrair_html_bcp.py --targets proyectos_normativos
+```
+
 Modo invisivel existe, mas pode ser bloqueado pelo site:
 
 ```powershell
@@ -59,7 +69,8 @@ python .\extrair_html_bcp.py --headless
 ## Testar com HTML local
 
 ```powershell
-python .\extrair_html_bcp.py --source-html "CAMINHO_DO_HTML" --base-dir ".\teste_saida" --no-open --no-pdf
+python .\extrair_html_bcp.py --targets circulares --source-html "CAMINHO_DO_HTML" --base-dir ".\teste_saida" --no-open --no-pdf
+python .\extrair_html_bcp.py --targets proyectos_normativos --source-html-proyectos "CAMINHO_DO_HTML" --base-dir ".\teste_saida" --no-open --no-pdf
 ```
 
 ## Agendar para 10h
