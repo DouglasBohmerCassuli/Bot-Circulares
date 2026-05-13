@@ -1,4 +1,4 @@
-# Bot BCP
+# Bot Circulares Banco Central do Paraguai
 
 Monitora diariamente duas paginas do Banco Central del Paraguay:
 
