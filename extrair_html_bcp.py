@@ -24,6 +24,7 @@ PROYECTOS_NORMATIVOS_URL = "https://www.bcp.gov.py/web/institucional/proyectos-n
 URL = CIRCULARES_URL
 DEFAULT_KEEP_RUNS = 10
 TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S_%f"
+_STEP_COUNTER = 0
 
 
 @dataclass(frozen=True)
@@ -444,9 +445,24 @@ def target_base_dir(base_dir: Path, target: MonitorTarget) -> Path:
     return base_dir / target.slug
 
 
-def configure_logging(log_dir: Path) -> None:
+def reset_step_counter() -> None:
+    global _STEP_COUNTER
+    _STEP_COUNTER = 0
+
+
+def log_step(message: str, *args: Any) -> None:
+    global _STEP_COUNTER
+    _STEP_COUNTER += 1
+    logging.info("PASSO %02d - " + message, _STEP_COUNTER, *args)
+
+
+def configure_logging(log_dir: Path, run_id: str | None = None) -> Path | None:
     log_file = log_dir / "bot.log"
     handlers: list[logging.Handler] = [logging.FileHandler(log_file, encoding="utf-8")]
+    run_log_file = log_dir / f"{run_id}_execucao.txt" if run_id else None
+    if run_log_file is not None:
+        handlers.append(logging.FileHandler(run_log_file, encoding="utf-8"))
+
     if sys.stdout is not None:
         handlers.append(logging.StreamHandler(sys.stdout))
 
@@ -456,6 +472,7 @@ def configure_logging(log_dir: Path) -> None:
         handlers=handlers,
         force=True,
     )
+    return run_log_file
 
 
 def console_print(message: str) -> None:
@@ -508,7 +525,7 @@ def fetch_live_htmls(
             "e depois python -m playwright install chromium"
         ) from exc
 
-    logging.info("Acessando %s", ", ".join(target.url for target in targets))
+    log_step("Preparando acesso ao site: %s", ", ".join(target.url for target in targets))
     launch_args = []
     if minimized and not headless:
         launch_args = [
@@ -518,6 +535,7 @@ def fetch_live_htmls(
         ]
 
     with sync_playwright() as playwright:
+        log_step("Abrindo Chromium com perfil persistente: %s", user_data_dir)
         context = playwright.chromium.launch_persistent_context(
             str(user_data_dir),
             headless=headless,
@@ -538,14 +556,17 @@ def fetch_live_htmls(
                 pages.append((target, page))
 
             if minimized and not headless:
+                log_step("Minimizando janela do Chromium")
                 minimize_browser_window(first_page)
 
             for target, page in pages:
-                logging.info("Abrindo aba %s: %s", target.label, target.url)
+                log_step("Abrindo aba %s: %s", target.label, target.url)
                 page.goto(target.url, wait_until="domcontentloaded", timeout=timeout_ms)
+                log_step("DOM carregado em %s", target.label)
 
             html_by_target: dict[str, str] = {}
             for target, page in pages:
+                log_step("Aguardando carregamento final de %s", target.label)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except PlaywrightTimeoutError:
@@ -556,6 +577,7 @@ def fetch_live_htmls(
 
                 try:
                     selector_timeout = 180000 if not headless else 20000
+                    log_step("Procurando conteudo principal de %s: %s", target.label, target.selector)
                     page.wait_for_selector(target.selector, timeout=selector_timeout)
                 except PlaywrightTimeoutError:
                     logging.warning(
@@ -565,10 +587,11 @@ def fetch_live_htmls(
                     )
 
                 html_by_target[target.slug] = page.content()
-                logging.info("HTML capturado: %s.", target.label)
+                log_step("HTML capturado de %s", target.label)
 
             return html_by_target
         finally:
+            log_step("Fechando Chromium")
             context.close()
 
 
@@ -761,6 +784,20 @@ def external_link(url: str, label: str | None = None) -> str:
     return f'<a href="{escape(url)}" target="_blank" rel="noopener">{escape(text)}</a>'
 
 
+def source_link(source: str) -> str:
+    if not source:
+        return ""
+
+    if urlparse(source).scheme in {"http", "https"}:
+        return external_link(source, source)
+
+    path = Path(source)
+    if path.exists():
+        return file_link(path, str(path))
+
+    return escape(source)
+
+
 def has_project_fields(items: list[dict[str, Any]]) -> bool:
     return any(item.get("period") or item.get("project_url") or item.get("comments_url") for item in items)
 
@@ -920,6 +957,7 @@ def write_report(
         removed_heading = f"{item_plural[:1].upper() + item_plural[1:]} removidos"
         changed_heading = f"{item_plural[:1].upper() + item_plural[1:]} alterados"
         all_heading = f"Todos os {item_plural} detectados agora"
+    source_view = source_link(current.get("source", ""))
 
     has_changes = bool(
         comparison["new_items"]
@@ -1078,7 +1116,7 @@ def write_report(
   <div class="{status_class}">{escape(status_text)}</div>
   <p>Execucao: {escape(generated_at)}</p>
   <p>{previous_info}</p>
-  <p>Fonte: {escape(current.get('source', ''))}</p>
+  <p>Fonte de captura: {source_view}</p>
   <p>Arquivos: {file_link(current['html_file'], 'HTML bruto')} | {file_link(current['text_file'], 'texto limpo')} | {file_link(current['snapshot_file'], 'snapshot JSON')}</p>
 
   <section class="summary">
@@ -1122,7 +1160,7 @@ def write_error_report(
 <main>
   <h1>Bot BCP - Erro na execucao - {escape(target_label)}</h1>
   <p>Execucao: {escape(timestamp)}</p>
-  <p>Fonte: {escape(source)}</p>
+  <p>Fonte de captura: {source_link(source)}</p>
   <pre>{escape(repr(error))}</pre>
 </main>
 </body>
@@ -1191,6 +1229,20 @@ def cleanup_old_runs(base_dir: Path, keep_runs: int) -> None:
             path.unlink()
 
 
+def cleanup_old_run_logs(log_dir: Path, keep_runs: int) -> None:
+    if keep_runs < 1:
+        keep_runs = 1
+
+    run_logs = sorted(
+        log_dir.glob("*_execucao.txt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in run_logs[keep_runs:]:
+        logging.info("Removendo log antigo: %s", path)
+        path.unlink()
+
+
 def build_targets(args: argparse.Namespace) -> list[MonitorTarget]:
     targets = [
         MonitorTarget(
@@ -1237,15 +1289,17 @@ def read_html_sources(
         source_html = source_html_for_target(args, target)
         if source_html:
             path = Path(source_html).expanduser().resolve()
-            logging.info("Lendo HTML local de %s: %s", target.label, path)
+            log_step("Lendo HTML local de %s: %s", target.label, path)
             html_sources[target.slug] = (
                 path.read_text(encoding="utf-8", errors="ignore"),
                 str(path),
             )
         else:
+            log_step("HTML local nao informado para %s; alvo sera buscado no site", target.label)
             live_targets.append(target)
 
     if live_targets:
+        log_step("Iniciando busca online de %s alvo(s)", len(live_targets))
         live_htmls = fetch_live_htmls(
             live_targets,
             args.timeout_ms,
@@ -1255,6 +1309,7 @@ def read_html_sources(
         )
         for target in live_targets:
             html_sources[target.slug] = (live_htmls[target.slug], target.url)
+            log_step("Fonte online registrada para %s", target.label)
 
     return html_sources
 
@@ -1278,8 +1333,10 @@ def process_target_html(
     report_path = dirs["reports"] / f"{timestamp}.html"
     pdf_path = dirs["reports"] / f"{timestamp}.pdf"
 
+    log_step("Salvando HTML bruto de %s em %s", target.label, html_path)
     save_text(html_path, page_html)
 
+    log_step("Verificando Cloudflare em %s", target.label)
     if is_cloudflare_challenge(page_html):
         raise RuntimeError(
             f"O site do BCP entregou uma verificacao do Cloudflare em vez da lista de {target.label}. "
@@ -1287,9 +1344,11 @@ def process_target_html(
             f"o perfil sera reaproveitado em {browser_profile_dir}."
         )
 
+    log_step("Extraindo itens de %s", target.label)
     if target.slug == "proyectos_normativos":
         items = extract_project_items(page_html, target.url)
         if not items:
+            log_step("Tabela de projetos nao encontrada; tentando extracao generica de %s", target.label)
             items = extract_items(page_html, target.url, keyword=target.keyword)
     else:
         items = extract_items(page_html, target.url, keyword=target.keyword)
@@ -1308,6 +1367,7 @@ def process_target_html(
         visible_lines = extract_visible_lines(page_html)
 
     clean_text = "\n".join(visible_lines)
+    log_step("Salvando texto limpo de %s em %s", target.label, text_path)
     save_text(text_path, clean_text)
 
     current_snapshot = {
@@ -1331,48 +1391,62 @@ def process_target_html(
         current_snapshot["circular_count"] = len(current_items)
         current_snapshot["circulars"] = current_items
 
+    log_step("Salvando snapshot JSON de %s em %s", target.label, snapshot_path)
     save_json(snapshot_path, current_snapshot)
 
+    log_step("Procurando snapshot anterior de %s para comparacao", target.label)
     previous_snapshot_path = latest_previous_snapshot(dirs["snapshots"], snapshot_path)
     previous_snapshot = load_json(previous_snapshot_path) if previous_snapshot_path else None
     previous_lines = load_snapshot_text(previous_snapshot) if previous_snapshot else []
 
+    log_step("Comparando snapshot atual com historico de %s", target.label)
     comparison = compare_snapshots(previous_snapshot, current_snapshot, previous_lines, visible_lines)
     logging.info("Status %s: %s", target.label, comparison["status"])
 
+    log_step("Gerando relatorio HTML de %s em %s", target.label, report_path)
     write_report(report_path, current_snapshot, previous_snapshot, comparison)
 
     if not args.no_pdf:
+        log_step("Gerando PDF de %s em %s", target.label, pdf_path)
         if generate_pdf(report_path, pdf_path):
             logging.info("PDF gerado: %s", pdf_path)
 
+    log_step("Limpando execucoes antigas de %s", target.label)
     cleanup_old_runs(target_dir, args.keep_runs)
     return report_path
 
 
 def run_monitor(args: argparse.Namespace) -> tuple[list[Path], bool]:
+    timestamp_dt = getattr(args, "execution_dt", None) or datetime.now()
+    timestamp = timestamp_dt.strftime(TIMESTAMP_FORMAT)
     base_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else get_user_base_dir()
     root_dirs = ensure_directories(base_dir)
-    configure_logging(root_dirs["logs"])
+    run_log_path = configure_logging(root_dirs["logs"], timestamp)
+    args.run_log_path = run_log_path
+    reset_step_counter()
+    log_step("Inicio da execucao do Bot BCP")
+    logging.info("Log acumulado: %s", root_dirs["logs"] / "bot.log")
+    if run_log_path is not None:
+        logging.info("Log desta execucao: %s", run_log_path)
+
     browser_profile_dir = (
         Path(args.user_data_dir).expanduser().resolve()
         if args.user_data_dir
         else base_dir / "browser_profile"
     )
+    log_step("Garantindo perfil do navegador em %s", browser_profile_dir)
     browser_profile_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp_dt = datetime.now()
-    timestamp = timestamp_dt.strftime(TIMESTAMP_FORMAT)
-
-    logging.info("Base de dados: %s", base_dir)
+    log_step("Base de dados definida em %s", base_dir)
     targets = build_targets(args)
-    logging.info("Alvos: %s", ", ".join(target.label for target in targets))
+    log_step("Alvos selecionados: %s", ", ".join(target.label for target in targets))
     html_sources = read_html_sources(args, targets, browser_profile_dir)
 
     report_paths: list[Path] = []
     has_error = False
 
     for target in targets:
+        log_step("Iniciando processamento de %s", target.label)
         target_dir = target_base_dir(base_dir, target)
         dirs = ensure_directories(target_dir)
         page_html, source = html_sources[target.slug]
@@ -1391,6 +1465,7 @@ def run_monitor(args: argparse.Namespace) -> tuple[list[Path], bool]:
             )
         except Exception as exc:
             has_error = True
+            log_step("Erro no processamento de %s; gerando relatorio de erro", target.label)
             logging.exception("Falha na execucao de %s", target.label)
             report_path = dirs["reports"] / f"{timestamp}_erro.html"
             write_error_report(report_path, exc, timestamp, source, target.label)
@@ -1399,8 +1474,12 @@ def run_monitor(args: argparse.Namespace) -> tuple[list[Path], bool]:
 
     if not args.no_open:
         for report_path in report_paths:
+            log_step("Abrindo relatorio no navegador: %s", report_path)
             webbrowser.open(report_path.resolve().as_uri())
 
+    log_step("Limpando logs antigos de execucao")
+    cleanup_old_run_logs(root_dirs["logs"], args.keep_runs)
+    log_step("Fim da execucao do Bot BCP")
     return report_paths, has_error
 
 
@@ -1451,19 +1530,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    args.execution_dt = datetime.now()
 
     try:
         report_paths, has_error = run_monitor(args)
         console_print("Relatorios gerados:")
         for report_path in report_paths:
             console_print(f"- {report_path}")
+        if getattr(args, "run_log_path", None):
+            console_print(f"Log da execucao: {args.run_log_path}")
         return 1 if has_error else 0
     except Exception as exc:
         base_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else get_user_base_dir()
         dirs = ensure_directories(base_dir)
-        configure_logging(dirs["logs"])
 
-        timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
+        timestamp = args.execution_dt.strftime(TIMESTAMP_FORMAT)
+        run_log_path = configure_logging(dirs["logs"], timestamp)
+        reset_step_counter()
+        log_step("Erro geral antes da conclusao da execucao")
         report_path = dirs["reports"] / f"{timestamp}_erro.html"
         logging.exception("Falha na execucao")
         source = (
@@ -1474,11 +1558,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         write_error_report(report_path, exc, timestamp, source)
         cleanup_old_runs(base_dir, args.keep_runs)
+        cleanup_old_run_logs(dirs["logs"], args.keep_runs)
 
         if not args.no_open:
+            log_step("Abrindo relatorio de erro no navegador: %s", report_path)
             webbrowser.open(report_path.resolve().as_uri())
 
         console_print(f"Erro. Relatorio gerado: {report_path}")
+        if run_log_path is not None:
+            console_print(f"Log da execucao: {run_log_path}")
         return 1
 
 

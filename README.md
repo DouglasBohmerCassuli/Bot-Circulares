@@ -11,6 +11,8 @@ O bot salva HTML bruto, texto limpo, snapshot JSON, relatorio HTML e PDF em:
 %USERPROFILE%\Bot BCP
 ```
 
+Os logs ficam em `%USERPROFILE%\Bot BCP\logs`. O arquivo `bot.log` acumula o historico geral, e cada execucao tambem gera um TXT proprio no formato `DATA_HORA_execucao.txt`, com os passos executados pelo bot.
+
 O snapshot captura todos os itens detectados no HTML carregado pelo site.
 Para projetos normativos, o bot compara somente a tabela da pagina: titulo, arquivo do projeto, tabela para comentarios e periodo de consulta. Esse historico fica em `%USERPROFILE%\Bot BCP\proyectos_normativos`.
 O historico mantem somente as 10 execucoes mais recentes, apagando automaticamente as mais antigas.
