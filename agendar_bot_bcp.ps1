@@ -7,6 +7,7 @@ $ScriptPath = Join-Path $ScriptDir "extrair_html_bcp.py"
 $PythonCommand = Get-Command pythonw -ErrorAction SilentlyContinue
 $Arguments = "`"$ScriptPath`" --headed --minimized"
 
+
 if (-not $PythonCommand) {
     $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
 }
